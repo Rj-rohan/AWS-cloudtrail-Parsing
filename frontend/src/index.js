@@ -1,8 +1,9 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { BrowserRouter, Routes, Route, useParams, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useParams } from 'react-router-dom';
 import './index.css';
 import App from './App';
+import Register from './Register';
 
 function UserRoute() {
   const { username } = useParams();
@@ -14,8 +15,8 @@ root.render(
   <React.StrictMode>
     <BrowserRouter>
       <Routes>
+        <Route path="/" element={<Register />} />
         <Route path="/:username" element={<UserRoute />} />
-        <Route path="/" element={<Navigate to="/aditya" replace />} />
       </Routes>
     </BrowserRouter>
   </React.StrictMode>

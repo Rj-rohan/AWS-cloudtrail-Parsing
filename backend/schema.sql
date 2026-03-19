@@ -1,8 +1,13 @@
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
+    username VARCHAR(100) UNIQUE,
     name VARCHAR(255) NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
-    role_arn VARCHAR(512) NOT NULL,
+    role_arn VARCHAR(512),
+    s3_bucket VARCHAR(255),
+    s3_prefix VARCHAR(512) DEFAULT '',
+    aws_region VARCHAR(50) DEFAULT 'us-east-1',
+    sync_pin_hash VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -13,7 +18,9 @@ CREATE TABLE IF NOT EXISTS activity_logs (
     service VARCHAR(100) NOT NULL,
     action VARCHAR(255) NOT NULL,
     score INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    event_id VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, event_id)
 );
 
 CREATE TABLE IF NOT EXISTS daily_scores (

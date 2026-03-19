@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import CalendarHeatmap from 'react-calendar-heatmap';
 import 'react-calendar-heatmap/dist/styles.css';
 import axios from 'axios';
@@ -6,361 +7,469 @@ import Dashboard from './Dashboard';
 import Visual from './Visual';
 import Resources from './Resources';
 
-function App({ username }) {
-  const [userData, setUserData] = useState(null);
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [selectedDay, setSelectedDay] = useState(null);
-  const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
-  const [view, setView] = useState('heatmap');
+const API = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+const IS_DEV = process.env.NODE_ENV === 'development';
 
-  const fetchUserActivity = async (userId) => {
+const SVC_COLORS = [
+  '#ff9900','#58a6ff','#3fb950','#bc8cff','#e3b341',
+  '#f85149','#79c0ff','#56d364','#d2a8ff','#ffa657',
+];
+
+function ownerKey(username) { return `cloudproof_owner_${username}`; }
+function isOwner(username)   { return localStorage.getItem(ownerKey(username)) === 'true'; }
+
+// ── Tier helpers ────────────────────────────────────────────────────────────
+const TIER_ORDER  = ['Beginner','Intermediate','Advanced','Expert','Elite'];
+const TIER_SCORES = { Beginner:0, Intermediate:100, Advanced:500, Expert:1500, Elite:5000 };
+function tierColor(tier) {
+  return { Beginner:'#8b949e', Intermediate:'#58a6ff', Advanced:'#e3b341', Expert:'#ff9900', Elite:'#bc8cff' }[tier] || '#8b949e';
+}
+function nextTierName(tier) {
+  const i = TIER_ORDER.indexOf(tier);
+  return i >= 0 && i < TIER_ORDER.length - 1 ? TIER_ORDER[i+1] : null;
+}
+
+// ── Main component ──────────────────────────────────────────────────────────
+export default function App({ username }) {
+  const navigate = useNavigate();
+
+  const [profile,  setProfile]  = useState(null);
+  const [loading,  setLoading]  = useState(true);
+  const [error,    setError]    = useState('');
+  const [tab,      setTab]      = useState('overview');
+  const [year,     setYear]     = useState(new Date().getFullYear());
+
+  // sync modal state
+  const [showSync, setShowSync]       = useState(false);
+  const [showTest, setShowTest]       = useState(false);
+  const [pin,      setPin]            = useState('');
+  const [syncing,  setSyncing]        = useState(false);
+  const [syncResult, setSyncResult]   = useState(null);
+
+  // toast
+  const [toast, setToast] = useState('');
+
+  const owner = isOwner(username);
+
+  // ── fetch profile ──────────────────────────────────────────────────────
+  const fetchProfile = useCallback(async () => {
     try {
       setLoading(true);
-      setError(null);
-      const response = await axios.get(`http://localhost:5000/api/users/${userId}/activity`);
-      setUserData(response.data);
-    } catch (error) {
-      console.error('Error fetching data:', error);
-      setError(error.response?.data?.error || 'Failed to load activity data');
+      setError('');
+      const { data } = await axios.get(`${API}/api/profile/${username}`);
+      setProfile(data);
+    } catch (e) {
+      if (e.response?.status === 404) setError('Profile not found.');
+      else setError('Failed to load profile.');
     } finally {
       setLoading(false);
     }
-  };
-
-  const fetchUser = async () => {
-    try {
-      const usersResponse = await axios.get('http://localhost:5000/api/users');
-      const foundUser = usersResponse.data.find(u => u.email.split('@')[0] === username);
-      if (!foundUser) {
-        setError('User not found');
-        setLoading(false);
-        return;
-      }
-      setUser(foundUser);
-      fetchUserActivity(foundUser.id);
-    } catch (error) {
-      setError('Failed to load user');
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchUser();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [username]);
 
-  const getAvailableYears = () => {
-    if (!userData || !userData.heatmap) return [new Date().getFullYear()];
-    const years = Object.keys(userData.heatmap).map(date => new Date(date).getFullYear());
-    return [...new Set(years)].sort((a, b) => b - a);
-  };
+  useEffect(() => {
+    if (!username) { navigate('/'); return; }
+    fetchProfile();
+  }, [username, fetchProfile, navigate]);
 
-  const getHeatmapData = () => {
-    if (!userData || !userData.heatmap) return [];
-    
-    return Object.entries(userData.heatmap)
-      .filter(([date]) => new Date(date).getFullYear() === selectedYear)
-      .map(([date, score]) => ({
-        date: date,
-        count: score
-      }));
-  };
+  // ── sync handlers ──────────────────────────────────────────────────────
+  const openSync = () => { setPin(''); setSyncResult(null); setShowSync(true); };
+  const openTest = () => { setPin(''); setSyncResult(null); setShowTest(true); };
+  const closeModal = () => { setShowSync(false); setShowTest(false); setPin(''); setSyncResult(null); };
 
-  const calculateStreaks = () => {
-    if (!userData || !userData.heatmap) return { current: 0, max: 0 };
-    
-    const allDates = Object.keys(userData.heatmap)
-      .map(date => new Date(date))
-      .sort((a, b) => a - b);
-    
-    if (allDates.length === 0) return { current: 0, max: 0 };
-    
-    let maxStreak = 1;
-    let tempStreak = 1;
-    
-    for (let i = 1; i < allDates.length; i++) {
-      const diffDays = (allDates[i] - allDates[i-1]) / (1000 * 60 * 60 * 24);
-      if (diffDays === 1) {
-        tempStreak++;
-        maxStreak = Math.max(maxStreak, tempStreak);
-      } else {
-        tempStreak = 1;
-      }
-    }
-    
-    let currentStreak = 1;
-    for (let i = allDates.length - 2; i >= 0; i--) {
-      const diffDays = (allDates[i + 1] - allDates[i]) / (1000 * 60 * 60 * 24);
-      if (diffDays === 1) {
-        currentStreak++;
-      } else {
-        break;
-      }
-    }
-    
-    return { current: currentStreak, max: maxStreak };
-  };
-
-  const getYearStats = () => {
-    const yearData = getHeatmapData();
-    const totalDays = yearData.length;
-    const totalScore = yearData.reduce((sum, day) => sum + day.count, 0);
-    return { totalDays, totalScore };
-  };
-
-  const streaks = calculateStreaks();
-
-  const getColorClass = (value) => {
-    if (!value || value.count === 0) return 'color-empty';
-    if (value.count < 10) return 'color-scale-1';
-    if (value.count < 25) return 'color-scale-2';
-    if (value.count < 50) return 'color-scale-3';
-    return 'color-scale-4';
-  };
-
-  const handleDayClick = (value) => {
-    if (value && value.count > 0) {
-      setSelectedDay(value);
+  const doSync = async (isTest) => {
+    if (!pin.trim()) return;
+    setSyncing(true);
+    setSyncResult(null);
+    const endpoint = isTest
+      ? `${API}/api/profile/${username}/test-sync`
+      : `${API}/api/profile/${username}/sync`;
+    try {
+      const { data } = await axios.post(endpoint, { sync_pin: pin });
+      setSyncResult({ ok: true, msg: data.message });
+      await fetchProfile();
+    } catch (e) {
+      setSyncResult({ ok: false, msg: e.response?.data?.error || 'Operation failed.' });
+    } finally {
+      setSyncing(false);
     }
   };
 
-  if (loading) {
-    return (
-      <div className="container">
-        <div className="header">
-          <h1>☁️ CloudProof</h1>
-          <p className="loading-text">Loading your AWS activity...</p>
-        </div>
-      </div>
-    );
-  }
+  // ── copy link ──────────────────────────────────────────────────────────
+  const copyLink = () => {
+    navigator.clipboard.writeText(window.location.href);
+    setToast('Profile link copied!');
+    setTimeout(() => setToast(''), 3000);
+  };
 
-  if (error) {
-    return (
-      <div className="container">
-        <div className="header">
-          <h1>☁️ CloudProof</h1>
-          <p className="error-text">Error: {error}</p>
-          <button onClick={fetchUser} className="retry-btn">Retry</button>
-        </div>
-      </div>
-    );
-  }
+  // ── loading / error ────────────────────────────────────────────────────
+  if (loading) return <SkeletonPage />;
+  if (error)   return <ErrorPage msg={error} />;
+  if (!profile) return null;
 
-  const endDate = new Date(selectedYear, 11, 31);
-  const startDate = new Date(selectedYear, 0, 1);
-  const availableYears = getAvailableYears();
-  const yearStats = getYearStats();
+  const { user, heatmap = {}, services = {}, recent_actions = [], total_score = 0, streaks = {}, credibility = {} } = profile;
+
+  // convert heatmap dict → array for CalendarHeatmap
+  const heatmapArr = Object.entries(heatmap)
+    .map(([date, score]) => ({ date, count: score }));
+
+  const yearData = heatmapArr.filter(d => d.date?.startsWith(String(year)));
+  const startDate = new Date(`${year}-01-01`);
+  const endDate   = new Date(`${year}-12-31`);
+
+  // available years from data + current year
+  const years = [...new Set([new Date().getFullYear(), ...heatmapArr.map(d => Number(d.date?.split('-')[0]))])]
+    .filter(Boolean).sort((a,b) => b - a);
+
+  // convert services dict → sorted array
+  const svcArr = Object.entries(services)
+    .map(([service, score]) => ({ service, score }))
+    .sort((a,b) => b.score - a.score);
+  const maxSvc = svcArr.length ? svcArr[0].score : 1;
+
+  // tier progress
+  const tier = credibility.tier || 'Beginner';
+  const tColor = tierColor(tier);
+  const nextTier = nextTierName(tier);
+  const prevScore = TIER_SCORES[tier] || 0;
+  const nextScore = nextTier ? TIER_SCORES[nextTier] : null;
+  const pct = nextScore ? Math.min(100, ((total_score - prevScore) / (nextScore - prevScore)) * 100) : 100;
 
   return (
-    <div className="container">
-      <div className="header">
-        <h1>☁️ CloudProof</h1>
-        <p>Verified AWS Hands-On Activity Tracker</p>
-        <div className="view-toggle">
-          <button 
-            className={view === 'heatmap' ? 'active' : ''}
-            onClick={() => setView('heatmap')}
-          >
-            📊 Heatmap
-          </button>
-          <button 
-            className={view === 'dashboard' ? 'active' : ''}
-            onClick={() => setView('dashboard')}
-          >
-            📋 Dashboard
-          </button>
-          <button 
-            className={view === 'visual' ? 'active' : ''}
-            onClick={() => setView('visual')}
-          >
-            🎨 Visual
-          </button>
-          <button 
-            className={view === 'resources' ? 'active' : ''}
-            onClick={() => setView('resources')}
-          >
-            💾 Resources
-          </button>
+    <div>
+      {IS_DEV && <div className="dev-banner">⚠ Development Mode — test features active for profile owners</div>}
+
+      {/* ── Navbar ──────────────────────────────────────────────────────── */}
+      <nav className="navbar">
+        <div className="navbar-inner">
+          <a href="/" className="navbar-logo">
+            <div className="logo-box">☁</div>
+            CloudProof
+          </a>
+
+          <div className="navbar-tabs">
+            {['overview','dashboard','visual','resources'].map(t => (
+              <button
+                key={t}
+                className={`nav-tab${tab === t ? ' active' : ''}`}
+                onClick={() => setTab(t)}
+              >
+                {t.charAt(0).toUpperCase() + t.slice(1)}
+              </button>
+            ))}
+          </div>
+
+          <div className="navbar-actions">
+            <button className="btn btn-ghost btn-sm" onClick={copyLink}>Share</button>
+            {owner && IS_DEV && (
+              <button className="btn btn-dev btn-sm" onClick={openTest}>
+                Generate Test Logs
+              </button>
+            )}
+            {owner && (
+              <button className="btn btn-primary btn-sm" onClick={openSync} disabled={syncing}>
+                {syncing ? <><span className="spinner" />Syncing…</> : 'Sync from AWS'}
+              </button>
+            )}
+          </div>
         </div>
+      </nav>
+
+      {/* ── Page ──────────────────────────────────────────────────────────── */}
+      <div className="page">
+
+        {/* Profile Hero */}
+        <div className="profile-hero">
+          <div className="profile-hero-top">
+            <div className="avatar">
+              {(user.name || username || '?')[0].toUpperCase()}
+            </div>
+            <div className="profile-details">
+              <div className="profile-name">{user.name || username}</div>
+              <div className="profile-handle">@{user.username || username}</div>
+              <div className="profile-meta">
+                <span className={`tier-badge tier-${tier}`}>{tier}</span>
+                {user.created_at && (
+                  <span className="meta-item">
+                    📅 Joined {new Date(user.created_at).toLocaleDateString('en-US',{month:'short',year:'numeric'})}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {nextTier && (
+            <div className="tier-progress">
+              <div className="tier-progress-label">
+                <span>Progress to {nextTier}</span>
+                <span style={{fontFamily:'JetBrains Mono,monospace'}}>{total_score} / {nextScore} pts</span>
+              </div>
+              <div className="progress-track">
+                <div className="progress-fill" style={{width:`${pct}%`, background: tColor}} />
+              </div>
+            </div>
+          )}
+
+          <div className="divider" />
+
+          <div className="stats-grid">
+            <div className="stat-card score">
+              <div className="stat-val">{total_score.toLocaleString()}</div>
+              <div className="stat-lbl">Total Score</div>
+            </div>
+            <div className="stat-card streak">
+              <div className="stat-val">{(streaks.current || 0) > 0 ? `${streaks.current}🔥` : 0}</div>
+              <div className="stat-lbl">Current Streak</div>
+            </div>
+            <div className="stat-card best">
+              <div className="stat-val">{streaks.longest || 0}</div>
+              <div className="stat-lbl">Longest Streak</div>
+            </div>
+            <div className="stat-card services">
+              <div className="stat-val">{svcArr.length}</div>
+              <div className="stat-lbl">Services Used</div>
+            </div>
+          </div>
+        </div>
+
+        {/* ── Tab Content ─────────────────────────────────────────────────── */}
+        {tab === 'overview' && (
+          <Overview
+            yearData={yearData}
+            startDate={startDate}
+            endDate={endDate}
+            years={years}
+            year={year}
+            onYear={setYear}
+            svcArr={svcArr}
+            maxSvc={maxSvc}
+            recent={recent_actions}
+          />
+        )}
+        {tab === 'dashboard' && <Dashboard username={username} apiBase={API} />}
+        {tab === 'visual'    && <Visual    username={username} apiBase={API} />}
+        {tab === 'resources' && <Resources username={username} apiBase={API} />}
       </div>
 
-      {view === 'dashboard' ? (
-        <Dashboard userId={user?.id} />
-      ) : view === 'visual' ? (
-        <Visual userId={user?.id} />
-      ) : view === 'resources' ? (
-        <Resources userId={user?.id} />
-      ) : (
-        <>
-          <div className="profile-card">
-            <div className="profile-header">
-              <div className="profile-info">
-                <h2>{user?.name || 'User'}</h2>
-                <p>{user?.email || ''}</p>
+      {/* ── Sync / Test Modal ──────────────────────────────────────────────── */}
+      {(showSync || showTest) && (
+        <div className="modal-overlay" onClick={e => e.target === e.currentTarget && closeModal()}>
+          <div className="modal">
+            {showTest ? (
+              <>
+                <div className="modal-title">Generate Test Logs</div>
+                <div className="modal-desc">
+                  Generates random CloudTrail-like events and feeds them through the scoring engine.
+                  <br /><br />
+                  <span style={{color:'var(--purple)',fontSize:'12px'}}>⚠ DEV ONLY — remove before production.</span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="modal-title">Sync from AWS S3</div>
+                <div className="modal-desc">
+                  Fetches new CloudTrail logs from your S3 bucket and updates your profile.
+                  <br />Existing scores are never deleted — even if S3 logs are removed later.
+                </div>
+              </>
+            )}
+
+            <div className="fg">
+              <label className="fl">Sync Password</label>
+              <input
+                className="fi"
+                type="password"
+                placeholder="Enter your sync password"
+                value={pin}
+                onChange={e => setPin(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && doSync(showTest)}
+                autoFocus
+              />
+            </div>
+
+            {syncResult && (
+              <div className={`alert alert-${syncResult.ok ? 'success' : 'error'}`}>
+                {syncResult.msg}
               </div>
-              <div className="stats">
-                <div className="stat-item">
-                  <div className="stat-value">{userData?.total_score || 0}</div>
-                  <div className="stat-label">Total Score</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-value">
-                    {streaks.current > 0 ? `🔥 ${streaks.current}` : streaks.current}
-                  </div>
-                  <div className="stat-label">Current Streak</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-value">{Object.keys(userData?.services || {}).length}</div>
-                  <div className="stat-label">Services Used</div>
-                </div>
-              </div>
+            )}
+
+            <div className="modal-footer">
+              <button className="btn btn-ghost" onClick={closeModal}>Cancel</button>
+              <button
+                className={`btn ${showTest ? 'btn-dev' : 'btn-primary'}`}
+                onClick={() => doSync(showTest)}
+                disabled={syncing || !pin.trim()}
+              >
+                {syncing
+                  ? <><span className="spinner" />Processing…</>
+                  : showTest ? 'Generate & Process' : 'Start Sync'
+                }
+              </button>
             </div>
           </div>
-
-          <div className="activity-section">
-            <div className="heatmap-header">
-              <h3 className="section-title">📊 Activity Contribution Graph - {selectedYear}</h3>
-              <div className="year-selector">
-                {availableYears.map(year => (
-                  <button
-                    key={year}
-                    className={`year-btn ${selectedYear === year ? 'active' : ''}`}
-                    onClick={() => setSelectedYear(year)}
-                  >
-                    {year}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="year-stats">
-              <div className="year-stat-item">
-                <span className="year-stat-value">{yearStats.totalScore}</span>
-                <span className="year-stat-label">points in {selectedYear}</span>
-              </div>
-              <div className="year-stat-item">
-                <span className="year-stat-value">{yearStats.totalDays}</span>
-                <span className="year-stat-label">active days</span>
-              </div>
-              <div className="year-stat-item">
-                <span className="year-stat-value">
-                  {streaks.current > 0 ? `🔥 ${streaks.current}` : streaks.current}
-                </span>
-                <span className="year-stat-label">current streak</span>
-              </div>
-              <div className="year-stat-item">
-                <span className="year-stat-value">{streaks.max}</span>
-                <span className="year-stat-label">longest streak</span>
-              </div>
-            </div>
-
-            <div className="heatmap-container">
-              {getHeatmapData().length > 0 ? (
-                <>
-                  <CalendarHeatmap
-                    startDate={startDate}
-                    endDate={endDate}
-                    values={getHeatmapData()}
-                    classForValue={getColorClass}
-                    showWeekdayLabels={true}
-                    onClick={handleDayClick}
-                    titleForValue={(value) => {
-                      if (!value || !value.date) return '';
-                      return `${value.date}: ${value.count || 0} points`;
-                    }}
-                  />
-                  <div className="legend">
-                    <span>Less</span>
-                    <div className="legend-box" style={{background: '#161b22'}}></div>
-                    <div className="legend-box" style={{background: '#0e4429'}}></div>
-                    <div className="legend-box" style={{background: '#006d32'}}></div>
-                    <div className="legend-box" style={{background: '#26a641'}}></div>
-                    <div className="legend-box" style={{background: '#39d353'}}></div>
-                    <span>More</span>
-                  </div>
-                </>
-              ) : (
-                <p className="no-data">No activity in {selectedYear}. Select another year or start using AWS services!</p>
-              )}
-            </div>
-          </div>
-
-          {selectedDay && (
-            <div className="selected-day-card">
-              <div className="selected-day-header">
-                <h3>📅 {selectedDay.date}</h3>
-                <button onClick={() => setSelectedDay(null)} className="close-btn">✕</button>
-              </div>
-              <div className="selected-day-score">
-                <span className="score-label">Total Score:</span>
-                <span className="score-value">{selectedDay.count} points</span>
-              </div>
-            </div>
-          )}
-
-          {Object.keys(userData?.services || {}).length > 0 && (
-            <div className="activity-section">
-              <h3 className="section-title">🔧 Service Breakdown</h3>
-              <div className="services-grid">
-                {Object.entries(userData.services)
-                  .sort(([, a], [, b]) => b - a)
-                  .map(([service, score]) => (
-                    <div key={service} className="service-card">
-                      <div className="service-icon">{getServiceIcon(service)}</div>
-                      <div className="service-name">{service}</div>
-                      <div className="service-score">{score}</div>
-                      <div className="service-bar">
-                        <div 
-                          className="service-bar-fill" 
-                          style={{width: `${(score / Math.max(...Object.values(userData.services))) * 100}%`}}
-                        ></div>
-                      </div>
-                    </div>
-                  ))}
-              </div>
-            </div>
-          )}
-
-          {userData?.recent_actions?.length > 0 && (
-            <div className="activity-section">
-              <h3 className="section-title">⚡ Recent Activity</h3>
-              <div className="recent-activity">
-                <ul className="activity-list">
-                  {userData.recent_actions.slice(0, 10).map((action, index) => (
-                    <li key={index} className="activity-item">
-                      <div className="activity-details">
-                        <span className="activity-date">{action.date}</span>
-                        <span className="activity-service">{action.service}</span>
-                        <span className="activity-action">{action.action}</span>
-                      </div>
-                      <span className="activity-score">+{action.score}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-          )}
-        </>
+        </div>
       )}
+
+      {/* Toast */}
+      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }
 
-function getServiceIcon(service) {
-  const icons = {
-    'EC2': '🖥️',
-    'S3': '🪣',
-    'IAM': '🔐',
-    'VPC': '🌐',
-    'LAMBDA': '⚡',
-    'RDS': '🗄️',
-    'CLOUDFORMATION': '📚',
-    'EKS': '☸️',
-  };
-  return icons[service] || '☁️';
+// ── Overview Tab ─────────────────────────────────────────────────────────────
+function Overview({ yearData, startDate, endDate, years, year, onYear, svcArr, maxSvc, recent }) {
+  return (
+    <>
+      {/* Heatmap */}
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">Activity Heatmap</span>
+          <div className="year-row">
+            {years.map(y => (
+              <button key={y} className={`year-btn${year === y ? ' active' : ''}`} onClick={() => onYear(y)}>
+                {y}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="heatmap-wrap">
+          <CalendarHeatmap
+            startDate={startDate}
+            endDate={endDate}
+            values={yearData}
+            classForValue={v => {
+              if (!v || !v.count) return 'color-empty';
+              if (v.count < 20) return 'color-scale-1';
+              if (v.count < 50) return 'color-scale-2';
+              if (v.count < 80) return 'color-scale-3';
+              return 'color-scale-4';
+            }}
+            showWeekdayLabels
+            titleForValue={v => v?.date ? `${v.date}: ${v.count||0} pts` : ''}
+          />
+        </div>
+        <div className="heatmap-legend">
+          <span>Less</span>
+          {['var(--surface2)','var(--green-1)','var(--green-2)','var(--green-3)','var(--green-4)'].map((c,i) => (
+            <div key={i} className="legend-cell" style={{background:c}} />
+          ))}
+          <span>More</span>
+        </div>
+      </div>
+
+      <div className="two-col">
+        {/* Service Breakdown */}
+        <div className="card">
+          <div className="card-header"><span className="card-title">Service Usage</span></div>
+          {svcArr.length === 0 ? (
+            <Empty ico="📊" ttl="No service data" desc="Sync your AWS logs to see service breakdown." />
+          ) : (
+            <div className="svc-list">
+              {svcArr.slice(0,10).map((s,i) => (
+                <div key={s.service} className="svc-row">
+                  <div className="svc-row-top">
+                    <div className="svc-name">
+                      <div className="svc-dot" style={{background: SVC_COLORS[i % SVC_COLORS.length]}} />
+                      {s.service}
+                    </div>
+                    <div className="svc-score">{s.score} pts</div>
+                  </div>
+                  <div className="svc-track">
+                    <div className="svc-fill" style={{
+                      width: `${(s.score / maxSvc) * 100}%`,
+                      background: SVC_COLORS[i % SVC_COLORS.length],
+                    }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Recent Activity */}
+        <div className="card">
+          <div className="card-header"><span className="card-title">Recent Activity</span></div>
+          {recent.length === 0 ? (
+            <Empty ico="⚡" ttl="No activity yet" desc="Your AWS actions appear here after syncing." />
+          ) : (
+            <table className="act-table">
+              <thead>
+                <tr><th>Date</th><th>Service</th><th>Action</th><th>Pts</th></tr>
+              </thead>
+              <tbody>
+                {recent.slice(0,10).map((a,i) => (
+                  <tr key={i}>
+                    <td style={{color:'var(--text-2)',fontSize:'11px'}} className="mono">{a.date}</td>
+                    <td><span className="tag-svc">{a.service}</span></td>
+                    <td className="mono" style={{fontSize:'11px'}}>{a.action}</td>
+                    <td><span className="pill-score">+{a.score}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </>
+  );
 }
 
-export default App;
+// ── Shared helpers ────────────────────────────────────────────────────────────
+function Empty({ ico, ttl, desc }) {
+  return (
+    <div className="empty">
+      <div className="empty-ico">{ico}</div>
+      <div className="empty-ttl">{ttl}</div>
+      <div className="empty-desc">{desc}</div>
+    </div>
+  );
+}
+
+function SkeletonPage() {
+  return (
+    <div>
+      <nav className="navbar">
+        <div className="navbar-inner">
+          <div className="navbar-logo"><div className="logo-box">☁</div>CloudProof</div>
+        </div>
+      </nav>
+      <div className="page">
+        <div className="skel-hero">
+          <div style={{display:'flex',gap:16,marginBottom:22}}>
+            <div className="skel" style={{width:68,height:68,borderRadius:'50%'}} />
+            <div style={{flex:1,display:'flex',flexDirection:'column',gap:8}}>
+              <div className="skel" style={{height:18,width:160}} />
+              <div className="skel" style={{height:13,width:110}} />
+              <div className="skel" style={{height:20,width:90,borderRadius:20}} />
+            </div>
+          </div>
+          <div className="stats-grid">
+            {[1,2,3,4].map(i=>(
+              <div key={i} className="stat-card">
+                <div className="skel" style={{height:26,marginBottom:8}} />
+                <div className="skel" style={{height:11,width:'55%',margin:'0 auto'}} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ErrorPage({ msg }) {
+  return (
+    <div>
+      <nav className="navbar">
+        <div className="navbar-inner">
+          <a href="/" className="navbar-logo"><div className="logo-box">☁</div>CloudProof</a>
+        </div>
+      </nav>
+      <div className="err-page">
+        <div style={{fontSize:44}}>☁</div>
+        <div style={{fontSize:18,fontWeight:600}}>Profile not found</div>
+        <div style={{fontSize:13,color:'var(--text-2)'}}>{msg}</div>
+        <a href="/" className="btn btn-primary" style={{marginTop:8}}>Create a Profile</a>
+      </div>
+    </div>
+  );
+}

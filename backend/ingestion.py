@@ -125,6 +125,126 @@ def process_cloudtrail_logs(user_id, role_arn, bucket_name):
         raise
 
 
+def process_user_s3_logs(user_id: int, bucket_name: str, s3_prefix: str = '', aws_region: str = 'us-east-1') -> int:
+    """
+    Process CloudTrail logs for a specific user from their own S3 bucket.
+    All parameters come from the user's stored profile — nothing is hardcoded.
+    Uses ambient AWS credentials from the machine (boto3 credential chain).
+    """
+    s3 = boto3.client('s3', region_name=aws_region)
+
+    last_processed = get_last_processed_timestamp(user_id)
+    if last_processed is not None:
+        last_processed = last_processed.replace(tzinfo=None)
+
+    activities = []
+    daily_service_scores = {}
+    daily_totals = {}
+    daily_action_scores = {}
+
+    paginator = s3.get_paginator('list_objects_v2')
+    paginate_kwargs = {'Bucket': bucket_name}
+    if s3_prefix:
+        paginate_kwargs['Prefix'] = s3_prefix
+
+    page_iterator = paginator.paginate(**paginate_kwargs)
+
+    for page in page_iterator:
+        for obj in page.get('Contents', []):
+            key = obj.get('Key')
+            if not key:
+                continue
+
+            if last_processed is not None:
+                if obj['LastModified'].replace(tzinfo=None) <= last_processed:
+                    continue
+
+            if not (key.endswith('.json') or key.endswith('.json.gz')):
+                continue
+
+            try:
+                s3_obj = s3.get_object(Bucket=bucket_name, Key=key)
+                if key.endswith('.gz'):
+                    with gzip.GzipFile(fileobj=BytesIO(s3_obj['Body'].read())) as gzipfile:
+                        log_data = json.loads(gzipfile.read())
+                else:
+                    log_data = json.loads(s3_obj['Body'].read().decode('utf-8'))
+            except Exception as e:
+                logger.warning(f"Error reading s3://{bucket_name}/{key}: {str(e)}")
+                continue
+
+            for record in log_data.get('Records', []):
+                try:
+                    read_only = record.get('readOnly')
+                    if isinstance(read_only, str):
+                        if read_only.lower() == 'true':
+                            continue
+                    elif read_only is True:
+                        continue
+
+                    event_time_str = record.get('eventTime')
+                    event_source = record.get('eventSource', '')
+                    event_name = record.get('eventName', '')
+
+                    if not event_time_str or not event_source or not event_name:
+                        continue
+
+                    event_time = datetime.strptime(event_time_str, '%Y-%m-%dT%H:%M:%SZ')
+                    service = event_source.split('.')[0].upper()
+                    action = event_name
+
+                    score = calculate_score(service, action)
+                    if score <= 0:
+                        continue
+
+                    date_key = event_time.date()
+                    service_key = f"{date_key}_{service}"
+                    action_key = f"{date_key}_{service}_{action}"
+
+                    daily_totals.setdefault(date_key, 0)
+                    daily_service_scores.setdefault(service_key, 0)
+                    daily_action_scores.setdefault(action_key, 0)
+
+                    if daily_totals[date_key] >= DAILY_SCORE_CAP:
+                        continue
+                    if daily_service_scores[service_key] >= SERVICE_DAILY_CAP:
+                        continue
+                    if daily_action_scores[action_key] >= ACTION_DAILY_CAP:
+                        continue
+
+                    # eventID is CloudTrail's unique identifier per event.
+                    # Storing it lets store_activities skip exact duplicates on re-sync.
+                    event_id = record.get('eventID')
+
+                    activities.append({
+                        'user_id': user_id,
+                        'date': date_key,
+                        'service': service,
+                        'action': action,
+                        'score': score,
+                        'event_id': event_id,
+                    })
+
+                    daily_totals[date_key] += score
+                    daily_service_scores[service_key] += score
+                    daily_action_scores[action_key] += score
+
+                except Exception as e:
+                    logger.warning(f"Error processing record from {key}: {str(e)}")
+                    continue
+
+    if activities:
+        store_activities(activities)
+        logger.info(f"Stored {len(activities)} activities for user {user_id} from s3://{bucket_name}")
+
+    try:
+        update_last_processed_timestamp(user_id, datetime.now())
+    except Exception as e:
+        logger.error(f"Error updating last processed timestamp: {str(e)}")
+
+    return len(activities)
+
+
 def process_local_cloudtrail_logs():
     """
     Process CloudTrail-style JSON or JSON.GZ log files from the local
@@ -231,6 +351,7 @@ def process_local_cloudtrail_logs():
                         "service": service,
                         "action": action,
                         "score": score,
+                        "event_id": record.get("eventID"),
                     }
                 )
 
@@ -379,6 +500,7 @@ def process_s3_cloudtrail_logs(bucket_name):
                             "service": service,
                             "action": action,
                             "score": score,
+                            "event_id": record.get("eventID"),
                         }
                     )
 
@@ -410,14 +532,35 @@ def process_s3_cloudtrail_logs(bucket_name):
     return len(activities)
 
 def store_activities(activities):
+    """
+    Insert scored activities and aggregate daily scores.
+    event_id is used as a dedup key — if the same CloudTrail event is seen
+    again (re-sync, reset, etc.) it is silently skipped so scores are never
+    double-counted. Heatmap data persists even if the source S3 logs are deleted.
+    """
     daily_aggregates = {}
     for activity in activities:
         try:
+            event_id = activity.get('event_id')
+
+            # Dedup check: if this event was already stored, skip entirely.
+            # This is the guard that makes stored scores permanent regardless
+            # of what happens to the S3 logs later.
+            if event_id:
+                already = execute_query(
+                    "SELECT 1 FROM activity_logs WHERE user_id = %s AND event_id = %s",
+                    (activity['user_id'], event_id),
+                    fetch=True,
+                )
+                if already:
+                    continue
+
             execute_query(
-                "INSERT INTO activity_logs (user_id, date, service, action, score) VALUES (%s, %s, %s, %s, %s)",
-                (activity['user_id'], activity['date'], activity['service'], activity['action'], activity['score'])
+                "INSERT INTO activity_logs (user_id, date, service, action, score, event_id) VALUES (%s, %s, %s, %s, %s, %s)",
+                (activity['user_id'], activity['date'], activity['service'], activity['action'], activity['score'], event_id)
             )
 
+            # Only reach here if the row was actually inserted.
             aggregate_key = (activity["user_id"], activity["date"])
             daily_aggregates[aggregate_key] = daily_aggregates.get(
                 aggregate_key, 0

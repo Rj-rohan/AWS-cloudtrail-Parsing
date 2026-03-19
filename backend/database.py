@@ -18,9 +18,14 @@ SQLITE_INITIALIZED = False
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
     name TEXT NOT NULL,
     email TEXT UNIQUE NOT NULL,
-    role_arn TEXT NOT NULL,
+    role_arn TEXT,
+    s3_bucket TEXT,
+    s3_prefix TEXT DEFAULT '',
+    aws_region TEXT DEFAULT 'us-east-1',
+    sync_pin_hash TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -31,9 +36,11 @@ CREATE TABLE IF NOT EXISTS activity_logs (
     service TEXT NOT NULL,
     action TEXT NOT NULL,
     score INTEGER NOT NULL,
+    event_id TEXT,
     timestamp TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(user_id, event_id)
 );
 
 CREATE TABLE IF NOT EXISTS daily_scores (
@@ -133,9 +140,38 @@ def _get_sqlite_connection():
 
 
 def _init_sqlite_schema(conn: sqlite3.Connection):
-    """Create all required tables if they do not already exist."""
+    """Create all required tables if they do not already exist, then migrate."""
     conn.executescript(SQLITE_SCHEMA)
     conn.commit()
+    _migrate_sqlite(conn)
+
+
+def _migrate_sqlite(conn: sqlite3.Connection):
+    """Add columns introduced in later versions to existing SQLite databases."""
+    new_columns = [
+        "ALTER TABLE users ADD COLUMN username TEXT",
+        "ALTER TABLE users ADD COLUMN s3_bucket TEXT",
+        "ALTER TABLE users ADD COLUMN s3_prefix TEXT DEFAULT ''",
+        "ALTER TABLE users ADD COLUMN aws_region TEXT DEFAULT 'us-east-1'",
+        "ALTER TABLE users ADD COLUMN sync_pin_hash TEXT",
+        "ALTER TABLE activity_logs ADD COLUMN event_id TEXT",
+    ]
+    for sql in new_columns:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except Exception:
+            pass  # Column already exists — safe to ignore
+
+    # Add unique index for event_id dedup (CREATE INDEX IF NOT EXISTS is safe to re-run)
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_logs_event_id "
+            "ON activity_logs(user_id, event_id) WHERE event_id IS NOT NULL"
+        )
+        conn.commit()
+    except Exception:
+        pass
 
 
 def _convert_sqlite_placeholders(query, params):
