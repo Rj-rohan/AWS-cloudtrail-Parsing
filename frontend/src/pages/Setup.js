@@ -136,8 +136,11 @@ export default function Setup() {
               Enter your AWS Access Key and Secret Key. These are stored encrypted and only used to read your CloudTrail logs.
               <br /><br />
               <span className="setup-tip">
-                💡 Go to <strong>AWS Console → IAM → Users → Security Credentials</strong> to create keys.
-                The key needs <code>s3:GetObject</code> + <code>s3:ListBucket</code> on your CloudTrail bucket.
+                💡 Go to <strong>AWS Console → IAM → Users → Security Credentials</strong> to create an access key.
+                <br /><br />
+                <strong>Minimum policy required:</strong> <code>AmazonS3ReadOnlyAccess</code>
+                <br />
+                Admin access or <code>AmazonS3FullAccess</code> also works — anything that includes S3 read permissions.
               </span>
             </div>
 
