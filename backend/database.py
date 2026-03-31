@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT NOT NULL,
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT,
+    email_verified INTEGER DEFAULT 0,
+    oauth_provider TEXT,
+    oauth_id TEXT,
     role_arn TEXT,
     s3_bucket TEXT,
     s3_prefix TEXT DEFAULT '',
@@ -30,6 +33,26 @@ CREATE TABLE IF NOT EXISTS users (
     aws_access_key_encrypted TEXT,
     aws_secret_key_encrypted TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token TEXT UNIQUE NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token TEXT UNIQUE NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    used INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS activity_logs (
@@ -154,6 +177,9 @@ def _migrate_sqlite(conn: sqlite3.Connection):
     new_columns = [
         "ALTER TABLE users ADD COLUMN username TEXT",
         "ALTER TABLE users ADD COLUMN password_hash TEXT",
+        "ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN oauth_provider TEXT",
+        "ALTER TABLE users ADD COLUMN oauth_id TEXT",
         "ALTER TABLE users ADD COLUMN s3_bucket TEXT",
         "ALTER TABLE users ADD COLUMN s3_prefix TEXT DEFAULT ''",
         "ALTER TABLE users ADD COLUMN aws_region TEXT DEFAULT 'us-east-1'",

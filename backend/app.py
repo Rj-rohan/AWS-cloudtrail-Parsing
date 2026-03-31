@@ -12,14 +12,22 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from ingestion import process_local_cloudtrail_logs, process_s3_cloudtrail_logs, process_user_s3_logs, store_activities
 from scoring import calculate_score, DAILY_SCORE_CAP, SERVICE_DAILY_CAP, ACTION_DAILY_CAP
 from config import get_credibility, CREDIBILITY_TIERS
-from auth import hash_password, verify_password, generate_token, require_auth
+from auth import (
+    hash_password, verify_password, generate_token, require_auth,
+    generate_verification_token, verify_email_token,
+    generate_reset_token, verify_reset_token, consume_reset_token,
+)
 from credentials import encrypt_credential, decrypt_credential
+from oauth import generate_state, verify_state, github_auth_url, github_get_user, google_auth_url, google_get_user
+from emailer import send_verification_email, send_reset_email
+
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True, allow_headers=['Content-Type', 'Authorization'], methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
 
 @app.errorhandler(404)
 def not_found(error):
@@ -792,11 +800,22 @@ def auth_signup():
         u = user[0]
         token = generate_token(u['id'])
         logger.info(f"New JWT account: {username} ({email})")
+
+        # Send verification email (silent in dev if SMTP not configured)
+        ver_token = generate_verification_token(u['id'])
+        send_verification_email(email, ver_token)
+
         return jsonify({
             'success': True,
             'message': 'Account created successfully.',
             'token': token,
-            'user': {'id': u['id'], 'username': u['username'], 'name': u['name'], 'email': u['email']},
+            'user': {
+                'id':             u['id'],
+                'username':       u['username'],
+                'name':           u['name'],
+                'email':          u['email'],
+                'email_verified': False,
+            },
         }), 201
     except Exception as e:
         logger.error(f"auth_signup error: {e}")
@@ -995,6 +1014,223 @@ def sync_logs(user_id):
     except Exception as e:
         logger.error(f"sync_logs error: {e}")
         return jsonify({'error': f'Sync failed: {str(e)}'}), 500
+
+
+# ── OAuth helpers ─────────────────────────────────────────────────────────────
+
+def _unique_username(base: str) -> str:
+    """Return base username if free, else append incrementing numbers."""
+    base = re.sub(r'[^a-z0-9_-]', '', base.lower())[:25] or 'user'
+    candidate = base
+    counter = 2
+    while execute_query("SELECT id FROM users WHERE username = %s", (candidate,), fetch=True):
+        candidate = f"{base}{counter}"
+        counter += 1
+    return candidate
+
+
+def _oauth_upsert_user(provider: str, info: dict) -> dict:
+    """
+    Find or create a user from OAuth profile data.
+    Priority: oauth_id match → email match → create new.
+    Returns the user row dict.
+    """
+    oauth_id = info['oauth_id']
+    email    = (info.get('email') or '').strip().lower() or None
+
+    # 1. Find by provider + oauth_id
+    existing = execute_query(
+        "SELECT id, username, name, email, s3_bucket FROM users WHERE oauth_provider = %s AND oauth_id = %s",
+        (provider, oauth_id), fetch=True
+    )
+    if existing:
+        return existing[0]
+
+    # 2. Find by email — link the OAuth provider to the existing account
+    if email:
+        by_email = execute_query(
+            "SELECT id, username, name, email, s3_bucket FROM users WHERE email = %s",
+            (email,), fetch=True
+        )
+        if by_email:
+            execute_query(
+                "UPDATE users SET oauth_provider = %s, oauth_id = %s, email_verified = 1 WHERE id = %s",
+                (provider, oauth_id, by_email[0]['id'])
+            )
+            return by_email[0]
+
+    # 3. Create new user
+    username = _unique_username(info.get('username_hint', 'user'))
+    name     = (info.get('name') or username).strip()
+    verified = 1 if info.get('email_verified') else 0
+
+    execute_query(
+        "INSERT INTO users (username, name, email, oauth_provider, oauth_id, email_verified) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (username, name, email, provider, oauth_id, verified)
+    )
+    user = execute_query(
+        "SELECT id, username, name, email, s3_bucket FROM users WHERE username = %s",
+        (username,), fetch=True
+    )
+    logger.info(f"New OAuth user created: {username} via {provider}")
+    return user[0]
+
+
+def _oauth_error_redirect(msg: str):
+    from flask import redirect as flask_redirect
+    import urllib.parse
+    return flask_redirect(f"{FRONTEND_URL}/login?error={urllib.parse.quote(msg)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOCIAL AUTH ROUTES  (/api/auth/github/*  /api/auth/google/*)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/auth/github')
+def auth_github():
+    """Kick off GitHub OAuth flow."""
+    from flask import redirect as flask_redirect
+    state = generate_state('github')
+    return flask_redirect(github_auth_url(state))
+
+
+@app.route('/api/auth/github/callback')
+def auth_github_callback():
+    """GitHub redirects here after user authorises."""
+    from flask import redirect as flask_redirect
+    import urllib.parse
+
+    error = request.args.get('error')
+    if error:
+        return _oauth_error_redirect(request.args.get('error_description', 'GitHub auth failed.'))
+
+    state = request.args.get('state', '')
+    if not verify_state(state, 'github'):
+        return _oauth_error_redirect('Invalid or expired OAuth state. Please try again.')
+
+    code = request.args.get('code', '')
+    try:
+        info  = github_get_user(code)
+        user  = _oauth_upsert_user('github', info)
+        token = generate_token(user['id'])
+        params = urllib.parse.urlencode({
+            'token':    token,
+            'username': user['username'],
+            'has_bucket': '1' if user.get('s3_bucket') else '0',
+        })
+        return flask_redirect(f"{FRONTEND_URL}/auth/callback?{params}")
+    except Exception as e:
+        logger.error(f"GitHub callback error: {e}")
+        return _oauth_error_redirect('GitHub sign-in failed. Please try again.')
+
+
+@app.route('/api/auth/google')
+def auth_google():
+    """Kick off Google OAuth flow."""
+    from flask import redirect as flask_redirect
+    state = generate_state('google')
+    return flask_redirect(google_auth_url(state))
+
+
+@app.route('/api/auth/google/callback')
+def auth_google_callback():
+    """Google redirects here after user authorises."""
+    from flask import redirect as flask_redirect
+    import urllib.parse
+
+    error = request.args.get('error')
+    if error:
+        return _oauth_error_redirect('Google sign-in was cancelled or failed.')
+
+    state = request.args.get('state', '')
+    if not verify_state(state, 'google'):
+        return _oauth_error_redirect('Invalid or expired OAuth state. Please try again.')
+
+    code = request.args.get('code', '')
+    try:
+        info  = google_get_user(code)
+        user  = _oauth_upsert_user('google', info)
+        token = generate_token(user['id'])
+        params = urllib.parse.urlencode({
+            'token':      token,
+            'username':   user['username'],
+            'has_bucket': '1' if user.get('s3_bucket') else '0',
+        })
+        return flask_redirect(f"{FRONTEND_URL}/auth/callback?{params}")
+    except Exception as e:
+        logger.error(f"Google callback error: {e}")
+        return _oauth_error_redirect('Google sign-in failed. Please try again.')
+
+
+# ── Email verification ────────────────────────────────────────────────────────
+
+@app.route('/api/auth/verify-email', methods=['GET'])
+def auth_verify_email():
+    """Consume an email verification token."""
+    token = request.args.get('token', '')
+    if not token:
+        return jsonify({'error': 'Token is required.'}), 400
+    user_id = verify_email_token(token)
+    if not user_id:
+        return jsonify({'error': 'Token is invalid or has expired.'}), 400
+    user = execute_query("SELECT id, username, email FROM users WHERE id = %s", (user_id,), fetch=True)
+    return jsonify({'success': True, 'message': 'Email verified.', 'username': user[0]['username']}), 200
+
+
+# ── Password reset ────────────────────────────────────────────────────────────
+
+@app.route('/api/auth/forgot-password', methods=['POST'])
+def auth_forgot_password():
+    """Send a password-reset email. Always returns 200 (prevents email enumeration)."""
+    data  = request.json or {}
+    email = (data.get('email') or '').strip().lower()
+    if not email:
+        return jsonify({'error': 'Email is required.'}), 400
+
+    user = execute_query("SELECT id, email FROM users WHERE email = %s", (email,), fetch=True)
+    if user:
+        token = generate_reset_token(user[0]['id'])
+        sent  = send_reset_email(email, token)
+        if not sent:
+            # Dev mode — return token so it can be tested without SMTP
+            logger.info(f"[DEV] password reset token for {email}: {token}")
+
+    return jsonify({
+        'success': True,
+        'message': 'If that email is registered, a reset link has been sent.',
+    }), 200
+
+
+@app.route('/api/auth/reset-password', methods=['POST'])
+def auth_reset_password():
+    """Set a new password using a reset token."""
+    data     = request.json or {}
+    token    = (data.get('token')    or '').strip()
+    password = (data.get('password') or '').strip()
+
+    if not token or not password:
+        return jsonify({'error': 'Token and new password are required.'}), 400
+    if len(password) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters.'}), 400
+
+    user_id = verify_reset_token(token)
+    if not user_id:
+        return jsonify({'error': 'Reset link is invalid or has expired.'}), 400
+
+    execute_query(
+        "UPDATE users SET password_hash = %s WHERE id = %s",
+        (hash_password(password), user_id)
+    )
+    consume_reset_token(token)
+    logger.info(f"Password reset for user {user_id}")
+    return jsonify({'success': True, 'message': 'Password updated. You can now sign in.'}), 200
+
+
+# ── Update /api/auth/signup to send verification email ───────────────────────
+# (The signup route already exists above; we patch behaviour via the email module)
+# When SMTP is configured, new email/password signups get a verification email.
+# OAuth signups are auto-verified by the provider.
 
 
 if __name__ == '__main__':

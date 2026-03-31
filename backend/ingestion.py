@@ -626,15 +626,21 @@ def get_last_processed_timestamp(user_id):
 
 def update_last_processed_timestamp(user_id, timestamp):
     try:
-        execute_query(
-            """
-            INSERT INTO processing_state (user_id, last_processed_timestamp) 
-            VALUES (%s, %s)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET last_processed_timestamp = EXCLUDED.last_processed_timestamp
-            """,
-            (user_id, timestamp)
+        from database import DB_ENGINE
+        existing = execute_query(
+            "SELECT id FROM processing_state WHERE user_id = %s",
+            (user_id,), fetch=True
         )
+        if existing:
+            execute_query(
+                "UPDATE processing_state SET last_processed_timestamp = %s WHERE user_id = %s",
+                (timestamp, user_id)
+            )
+        else:
+            execute_query(
+                "INSERT INTO processing_state (user_id, last_processed_timestamp) VALUES (%s, %s)",
+                (user_id, timestamp)
+            )
     except Exception as e:
         logger.error(f"Error updating last processed timestamp: {str(e)}")
         raise
