@@ -184,11 +184,22 @@ def _validate_log_metadata(records, s3_key):
 
 
 def _verify_sample_via_api(records, ak, sk, region, sample_rate=0.1):
-    """Layer 3: Randomly verify 10% of events via CloudTrail API - cannot be faked."""
+    """Layer 3: Randomly verify 10% of scoreable events via CloudTrail API - cannot be faked."""
     if not ak or not sk:
         return True
 
-    scoreable = [r for r in records if r.get('eventID')]
+    # Only verify events that actually score points (not read-only actions)
+    from scoring import calculate_score, should_ignore_action
+    scoreable = [
+        r for r in records
+        if r.get('eventID')
+        and not r.get('readOnly', False)
+        and not should_ignore_action(r.get('eventName', ''))
+        and calculate_score(
+            r.get('eventSource', '').split('.')[0].upper(),
+            r.get('eventName', '')
+        ) > 0
+    ]
     if not scoreable:
         return True
 

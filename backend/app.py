@@ -769,20 +769,19 @@ def _generate_test_activities(user_id):
 # Existing routes (/api/register, /api/profile/*) are NOT changed.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.route('/api/auth/signup', methods=['POST'])
-def auth_signup():
+@app.route('/api/auth/preflight', methods=['POST'])
+def auth_preflight():
     """
-    Create an account with email + password.
-    S3 bucket is NOT required here — users configure it after login via /setup.
+    Step 1 of signup: Validate username/email availability WITHOUT creating the account.
+    Account is only created after AWS credentials are verified in /api/credentials/register.
     """
     try:
         data = request.json or {}
-        missing = [f for f in ['username', 'name', 'email', 'password'] if not data.get(f)]
+        missing = [f for f in ['username', 'email', 'password'] if not data.get(f)]
         if missing:
             return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
 
         username = data['username'].strip().lower()
-        name     = data['name'].strip()
         email    = data['email'].strip().lower()
         password = data['password']
 
@@ -790,23 +789,84 @@ def auth_signup():
             return jsonify({'error': 'Username: 3–30 chars, lowercase letters/numbers/hyphens/underscores.'}), 400
         if len(password) < 8:
             return jsonify({'error': 'Password must be at least 8 characters.'}), 400
-
-        if execute_query("SELECT id FROM users WHERE email = %s",    (email,),    fetch=True):
+        if execute_query("SELECT id FROM users WHERE email = %s", (email,), fetch=True):
             return jsonify({'error': 'Email already registered.'}), 409
         if execute_query("SELECT id FROM users WHERE username = %s", (username,), fetch=True):
             return jsonify({'error': 'Username already taken.'}), 409
 
+        # All good — tell frontend to proceed to AWS credentials step
+        return jsonify({'success': True, 'message': 'Username and email are available.'}), 200
+    except Exception as e:
+        logger.error(f"auth_preflight error: {e}")
+        return jsonify({'error': 'Validation failed.'}), 500
+
+
+@app.route('/api/auth/signup', methods=['POST'])
+def auth_signup():
+    """
+    Final signup step: called AFTER AWS credentials are verified.
+    Creates the account only when we know the AWS Account ID is unique.
+    Expects: username, name, email, password, access_key, secret_key, region
+    """
+    try:
+        data = request.json or {}
+        missing = [f for f in ['username', 'name', 'email', 'password', 'access_key', 'secret_key'] if not data.get(f)]
+        if missing:
+            return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
+
+        username   = data['username'].strip().lower()
+        name       = data['name'].strip()
+        email      = data['email'].strip().lower()
+        password   = data['password']
+        access_key = data['access_key'].strip()
+        secret_key = data['secret_key'].strip()
+        region     = data.get('region', 'us-east-1').strip()
+
+        if not re.match(r'^[a-z0-9_-]{3,30}$', username):
+            return jsonify({'error': 'Username: 3–30 chars, lowercase letters/numbers/hyphens/underscores.'}), 400
+        if len(password) < 8:
+            return jsonify({'error': 'Password must be at least 8 characters.'}), 400
+        if execute_query("SELECT id FROM users WHERE email = %s", (email,), fetch=True):
+            return jsonify({'error': 'Email already registered.'}), 409
+        if execute_query("SELECT id FROM users WHERE username = %s", (username,), fetch=True):
+            return jsonify({'error': 'Username already taken.'}), 409
+
+        # Verify AWS credentials and get Account ID
+        try:
+            sts = boto3.client('sts', aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name=region)
+            identity = sts.get_caller_identity()
+            aws_account_id = identity['Account']
+            aws_user_arn   = identity['Arn']
+        except Exception as aws_err:
+            return jsonify({'error': f'Invalid AWS credentials: {aws_err}'}), 400
+
+        # Check AWS Account ID uniqueness BEFORE creating account
+        existing = execute_query(
+            "SELECT username FROM users WHERE aws_account_id = %s",
+            (aws_account_id,), fetch=True
+        )
+        if existing:
+            return jsonify({
+                'error': f'This AWS account is already linked to @{existing[0]["username"]}. '
+                         f'Each AWS account can only have one CloudProof profile.'
+            }), 409
+
+        # All checks passed — NOW create the account
+        from credentials import encrypt_credential
         pwd_hash = hash_password(password)
         execute_query(
-            "INSERT INTO users (username, name, email, password_hash) VALUES (%s, %s, %s, %s)",
-            (username, name, email, pwd_hash)
+            "INSERT INTO users (username, name, email, password_hash, aws_account_id, aws_user_arn, "
+            "aws_access_key_encrypted, aws_secret_key_encrypted, aws_region) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (username, name, email, pwd_hash, aws_account_id, aws_user_arn,
+             encrypt_credential(access_key), encrypt_credential(secret_key), region)
         )
-        user = execute_query("SELECT id, username, name, email FROM users WHERE email = %s", (email,), fetch=True)
-        u = user[0]
-        token = generate_token(u['id'])
-        logger.info(f"New JWT account: {username} ({email})")
 
-        # Send verification email (silent in dev if SMTP not configured)
+        user = execute_query("SELECT id, username, name, email FROM users WHERE email = %s", (email,), fetch=True)
+        u     = user[0]
+        token = generate_token(u['id'])
+        logger.info(f"New account created: {username} ({email}) -> AWS account {aws_account_id}")
+
         ver_token = generate_verification_token(u['id'])
         send_verification_email(email, ver_token)
 
@@ -820,6 +880,7 @@ def auth_signup():
                 'name':           u['name'],
                 'email':          u['email'],
                 'email_verified': False,
+                'has_bucket':     False,
             },
         }), 201
     except Exception as e:
