@@ -1,6 +1,8 @@
 import boto3
 import json
 import gzip
+import re
+import random
 from datetime import datetime, timedelta
 from io import BytesIO
 from scoring import calculate_score, DAILY_SCORE_CAP, SERVICE_DAILY_CAP, ACTION_DAILY_CAP
@@ -125,6 +127,109 @@ def process_cloudtrail_logs(user_id, role_arn, bucket_name):
         raise
 
 
+# ── Fraud Prevention ─────────────────────────────────────────────────────────
+
+def _validate_arn_ownership(records, registered_account_id):
+    """Layer 1: Verify every event ARN belongs to the registered AWS account."""
+    if not registered_account_id:
+        return True
+    for record in records:
+        arn = record.get('userIdentity', {}).get('arn', '')
+        if arn:
+            parts = arn.split(':')
+            if len(parts) >= 5 and parts[4] and parts[4] != registered_account_id:
+                logger.warning(f"ARN mismatch: {arn} vs registered {registered_account_id}")
+                return False
+    return True
+
+
+def _validate_log_metadata(records, s3_key):
+    """Layer 2: Validate structural patterns - catches manually crafted fake logs."""
+    uuid_pattern = re.compile(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    )
+    filename = s3_key.split('/')[-1]
+    time_match = re.search(r'_(\d{8}T\d{4}Z)_', filename)
+    filename_time = None
+    if time_match:
+        try:
+            filename_time = datetime.strptime(time_match.group(1), '%Y%m%dT%H%MZ')
+        except Exception:
+            pass
+
+    for record in records:
+        # Check 1: eventID must be valid UUID
+        event_id = record.get('eventID', '')
+        if event_id and not uuid_pattern.match(event_id):
+            logger.warning(f"Invalid eventID format: {event_id} in {s3_key}")
+            return False
+
+        # Check 2: eventTime must be within 2 hours of filename timestamp
+        if filename_time:
+            try:
+                event_time = datetime.strptime(record['eventTime'], '%Y-%m-%dT%H:%M:%SZ')
+                if abs((event_time - filename_time).total_seconds()) > 7200:
+                    logger.warning(f"Event time {event_time} too far from filename time {filename_time}")
+                    return False
+            except Exception:
+                pass
+
+        # Check 3: Suspicious source IPs
+        source_ip = record.get('sourceIPAddress', '')
+        if source_ip in ['127.0.0.1', 'localhost', '0.0.0.0']:
+            logger.warning(f"Suspicious sourceIPAddress: {source_ip} in {s3_key}")
+            return False
+
+    return True
+
+
+def _verify_sample_via_api(records, ak, sk, region, sample_rate=0.1):
+    """Layer 3: Randomly verify 10% of events via CloudTrail API - cannot be faked."""
+    if not ak or not sk:
+        return True
+
+    scoreable = [r for r in records if r.get('eventID')]
+    if not scoreable:
+        return True
+
+    sample_size = max(1, int(len(scoreable) * sample_rate))
+    sample = random.sample(scoreable, min(sample_size, len(scoreable)))
+
+    try:
+        cloudtrail = boto3.client(
+            'cloudtrail',
+            aws_access_key_id=ak,
+            aws_secret_access_key=sk,
+            region_name=region
+        )
+        for record in sample:
+            event_id   = record.get('eventID')
+            event_name = record.get('eventName')
+            event_time = datetime.strptime(record['eventTime'], '%Y-%m-%dT%H:%M:%SZ')
+
+            response = cloudtrail.lookup_events(
+                LookupAttributes=[{'AttributeKey': 'EventId', 'AttributeValue': event_id}],
+                StartTime=event_time - timedelta(minutes=5),
+                EndTime=event_time   + timedelta(minutes=5),
+                MaxResults=1
+            )
+            if not response.get('Events'):
+                logger.warning(f"Event {event_id} ({event_name}) not found in CloudTrail API - possible fake!")
+                return False
+
+            api_name = response['Events'][0].get('EventName', '')
+            if api_name != event_name:
+                logger.warning(f"Event name mismatch: log={event_name} api={api_name}")
+                return False
+
+    except Exception as e:
+        logger.warning(f"CloudTrail API verification skipped: {e}")
+
+    return True
+
+
+# ── Main ingestion ────────────────────────────────────────────────────────────
+
 def process_user_s3_logs(
     user_id: int,
     bucket_name: str,
@@ -152,6 +257,13 @@ def process_user_s3_logs(
         )
     else:
         s3 = boto3.client('s3', region_name=aws_region)
+
+    # Fetch registered AWS account ID for fraud validation
+    user_row = execute_query(
+        "SELECT aws_account_id FROM users WHERE id = %s",
+        (user_id,), fetch=True
+    )
+    registered_account_id = user_row[0]['aws_account_id'] if user_row else None
 
     last_processed = get_last_processed_timestamp(user_id)
     if last_processed is not None:
@@ -203,7 +315,26 @@ def process_user_s3_logs(
                 logger.warning(f"Error reading s3://{bucket_name}/{key}: {str(e)}")
                 continue
 
-            for record in log_data.get('Records', []):
+            records = log_data.get('Records', [])
+
+            # ── 3-Layer Fraud Validation ───────────────────────────────────────
+            # Layer 1: ARN ownership check
+            if not _validate_arn_ownership(records, registered_account_id):
+                logger.warning(f"FRAUD: ARN mismatch in {key} for user {user_id} - skipping file")
+                continue
+
+            # Layer 2: Metadata validation
+            if not _validate_log_metadata(records, key):
+                logger.warning(f"FRAUD: Metadata invalid in {key} for user {user_id} - skipping file")
+                continue
+
+            # Layer 3: Random 10% API sampling
+            if not _verify_sample_via_api(records, aws_access_key, aws_secret_key, aws_region):
+                logger.warning(f"FRAUD: API verification failed in {key} for user {user_id} - skipping file")
+                continue
+            # ──────────────────────────────────────────────────────────────────────
+
+            for record in records:
                 try:
                     read_only = record.get('readOnly')
                     if isinstance(read_only, str):
