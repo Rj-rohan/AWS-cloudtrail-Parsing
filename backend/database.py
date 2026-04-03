@@ -188,6 +188,7 @@ def _migrate_sqlite(conn: sqlite3.Connection):
         "ALTER TABLE users ADD COLUMN aws_secret_key_encrypted TEXT",
         "ALTER TABLE users ADD COLUMN aws_account_id TEXT",
         "ALTER TABLE users ADD COLUMN aws_user_arn TEXT",
+        "ALTER TABLE users ADD COLUMN last_auto_synced_at TIMESTAMP",
         "ALTER TABLE activity_logs ADD COLUMN event_id TEXT",
     ]
     for sql in new_columns:
