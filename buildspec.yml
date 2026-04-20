@@ -17,6 +17,8 @@ phases:
 
   post_build:
     commands:
+      - echo "Current directory:"
+      - pwd
       - chmod +x scripts/*.sh
 
 artifacts:
