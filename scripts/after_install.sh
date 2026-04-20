@@ -9,6 +9,14 @@ python3 -m venv venv
 venv/bin/pip install --upgrade pip
 venv/bin/pip install -r requirements.txt
 
+# Create empty database file with correct permissions
+touch /home/ubuntu/backend/cloudproof.db
+chown ubuntu:ubuntu /home/ubuntu/backend/cloudproof.db
+chmod 664 /home/ubuntu/backend/cloudproof.db
+
+# Ensure backend directory is owned by ubuntu
+chown -R ubuntu:ubuntu /home/ubuntu/backend
+
 # Safe .env copy
 if [ ! -f /home/ubuntu/backend/.env ]; then
     if [ -f /home/ubuntu/backend/.env.example ]; then
