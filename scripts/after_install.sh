@@ -2,7 +2,7 @@
 set -e
 
 apt-get update -y
-apt-get install -y python3-dev build-essential
+apt-get install -y python3-dev build-essential python3.12-venv
 
 cd /home/ubuntu/backend
 python3 -m venv venv
