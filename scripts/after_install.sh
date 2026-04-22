@@ -18,13 +18,6 @@ fi
 venv/bin/pip install --upgrade pip
 venv/bin/pip install -r requirements.txt psycopg2-binary python-dotenv
 
-# ---------------- ENV FILE ----------------
-if [ ! -f ".env" ]; then
-    if [ -f ".env.example" ]; then
-        cp .env.example .env
-    fi
-fi
-
 # ---------------- FETCH DB HOST FROM SSM ----------------
 echo "Fetching DB_HOST from SSM..."
 DB_HOST=$(aws ssm get-parameter \
@@ -46,6 +39,24 @@ DB_PASSWORD=$(echo $SECRET | python3 -c "import sys, json; print(json.load(sys.s
 DB_NAME=$(echo $SECRET | python3 -c "import sys, json; print(json.load(sys.stdin)['dbname'])")
 
 export PGPASSWORD=$DB_PASSWORD
+
+# ---------------- GENERATE .env FROM SSM ----------------
+SECRET_KEY=$(aws ssm get-parameter \
+  --name /cloudproof/SECRET_KEY \
+  --region ap-south-1 \
+  --query Parameter.Value \
+  --output text 2>/dev/null || echo "change-this-to-a-random-secret")
+
+cat > /home/ubuntu/backend/.env <<ENVEOF
+DB_ENGINE=postgres
+DB_HOST=$DB_HOST
+DB_PORT=5432
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+SECRET_KEY=$SECRET_KEY
+FRONTEND_URL=https://handsoncloud.in
+ENVEOF
 
 # ---------------- WAIT FOR RDS ----------------
 echo "Waiting for RDS..."
