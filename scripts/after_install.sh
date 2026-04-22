@@ -5,7 +5,7 @@ echo "Starting AfterInstall..."
 # ---------------- SYSTEM SETUP ----------------
 apt-get update -y
 apt-get install -y python3-dev build-essential python3.12-venv \
-                   postgresql-client netcat-openbsd awscli nginx \
+                   postgresql-client netcat-openbsd nginx \
                    certbot python3-certbot-nginx
 
 cd /home/ubuntu/backend
